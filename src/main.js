@@ -2,18 +2,28 @@ const API = location.origin;
 const clientId = localStorage.getItem('clientId') || crypto.randomUUID();
 localStorage.setItem('clientId', clientId);
 
-const state = { wallet: null, settings: null, files: [], job: null, busy: false, error: '', mode: 'text' };
+const state = { wallet: null, settings: null, files: [], job: null, busy: false, error: '', mode: 'text', prompt: '', negativePrompt: '' };
 const app = document.getElementById('app');
 const samplePrompt = 'Cinematic ultra-realistic product launch video, smooth dolly movement, dramatic lighting, premium color grade, 4K detail';
 const sampleNegative = 'low quality, blurry, warped faces, flicker, text artifacts';
 
 function escapeHtml(value) {
-  return String(value).replace(/[&<>"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[char]);
+  return String(value).replace(/[&<>\"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;' })[char]);
+}
+
+function rememberFormValues(form) {
+  if (!form) return;
+  const prompt = form.elements.prompt?.value;
+  const negativePrompt = form.elements.negativePrompt?.value;
+  if (prompt != null) state.prompt = prompt;
+  if (negativePrompt != null) state.negativePrompt = negativePrompt;
 }
 
 function render() {
   const output = Array.isArray(state.job?.prediction?.output) ? state.job.prediction.output[0] : state.job?.prediction?.output;
   const dailyCredits = state.wallet?.dailyCredits ?? 8;
+  const prompt = state.prompt || samplePrompt;
+  const negativePrompt = state.negativePrompt || sampleNegative;
   app.innerHTML = `
     <section class="hero">
       <div>
@@ -26,9 +36,9 @@ function render() {
     <form class="studio" id="studio">
       <div class="panel wide">
         <label>Production prompt</label>
-        <textarea name="prompt" minlength="12">${escapeHtml(samplePrompt)}</textarea>
+        <textarea name="prompt" minlength="12">${escapeHtml(prompt)}</textarea>
         <label>Accuracy guard / negative prompt</label>
-        <input name="negativePrompt" value="${escapeHtml(sampleNegative)}" />
+        <input name="negativePrompt" value="${escapeHtml(negativePrompt)}" />
       </div>
       <div class="panel">
         <label>Generation mode</label>
@@ -50,7 +60,8 @@ function render() {
       <form id="settings">
         <input name="replicateToken" placeholder="Replicate API token: r8_..." autocomplete="off" />
         <input name="adminPin" placeholder="Admin PIN, if configured" autocomplete="off" />
-        <input name="model" placeholder="Model slug/version, optional" value="${escapeHtml(state.settings?.model || '')}" />
+        <input name="model" placeholder="Model slug, optional" value="${escapeHtml(state.settings?.model || '')}" />
+        <input name="version" placeholder="Replicate version ID, optional" value="${escapeHtml(state.settings?.version || '')}" />
         <button type="submit">Save API</button>
       </form>
     </section>
@@ -65,9 +76,11 @@ function render() {
 }
 
 function bind() {
-  document.getElementById('refs').addEventListener('change', (event) => { state.files = [...event.target.files].slice(0, 6); render(); });
-  document.querySelectorAll('[data-mode]').forEach((button) => button.addEventListener('click', () => { state.mode = button.dataset.mode; render(); }));
-  document.getElementById('studio').addEventListener('submit', generate);
+  const studio = document.getElementById('studio');
+  document.getElementById('refs').addEventListener('change', (event) => { rememberFormValues(studio); state.files = [...event.target.files].slice(0, 6); render(); });
+  document.querySelectorAll('[data-mode]').forEach((button) => button.addEventListener('click', () => { rememberFormValues(studio); state.mode = button.dataset.mode; render(); }));
+  studio.addEventListener('input', () => rememberFormValues(studio));
+  studio.addEventListener('submit', generate);
   document.getElementById('settings').addEventListener('submit', saveSettings);
   document.getElementById('upgrade').addEventListener('submit', upgrade);
 }
@@ -84,14 +97,20 @@ async function refreshCredits() {
 
 async function generate(event) {
   event.preventDefault();
+  rememberFormValues(event.currentTarget);
   state.busy = true; state.error = ''; state.job = null; render();
   const form = new FormData(event.currentTarget);
   state.files.forEach((file) => form.append('references', file));
-  const res = await fetch(`${API}/api/generate-video`, { method: 'POST', headers: { 'x-client-id': clientId }, body: form });
-  const data = await res.json();
-  state.busy = false;
-  if (!res.ok) state.error = data.error || 'Generation failed';
-  else { state.wallet = data.wallet; state.job = data; pollJob(data.jobId); }
+  try {
+    const res = await fetch(`${API}/api/generate-video`, { method: 'POST', headers: { 'x-client-id': clientId }, body: form });
+    const data = await res.json();
+    state.busy = false;
+    if (!res.ok) state.error = data.error || 'Generation failed';
+    else { state.wallet = data.wallet; state.job = data; pollJob(data.jobId); }
+  } catch (error) {
+    state.busy = false;
+    state.error = error.message || 'Network error while generating video';
+  }
   render();
 }
 
@@ -120,7 +139,7 @@ function pollJob(jobId) {
   const timer = setInterval(async () => {
     const res = await fetch(`${API}/api/jobs/${jobId}`, { headers: { 'x-client-id': clientId } });
     const data = await res.json();
-    if (res.ok) {
+    if (res.ok || res.status === 202) {
       state.job = { jobId, ...data };
       render();
       if (['succeeded', 'failed', 'canceled'].includes(data.prediction?.status)) clearInterval(timer);
