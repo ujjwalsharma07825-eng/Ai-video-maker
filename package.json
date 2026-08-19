@@ -1,0 +1,13 @@
+{
+  "scripts": {
+    "dev": "node server/index.js",
+    "server": "node server/index.js",
+    "start": "node server/index.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "private": true,
+  "type": "module"
+}
