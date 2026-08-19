@@ -22,6 +22,15 @@ await loadDotEnv();
 const PORT = Number(process.env.PORT || 8787);
 export let PRO_DAILY_CREDITS = Number(process.env.PRO_DAILY_CREDITS || 100);
 
+// Serialize only database read/modify/write sections. Provider requests happen outside
+// the lock so one slow video generation does not block unrelated requests.
+let dbQueue = Promise.resolve();
+function withDbLock(task) {
+  const next = dbQueue.then(task, task);
+  dbQueue = next.catch(() => {});
+  return next;
+}
+
 async function loadDotEnv() {
   try {
     const envPath = path.join(ROOT, '.env');
@@ -177,27 +186,44 @@ async function replicateCreate(input) {
     throw Object.assign(new Error('REPLICATE_API_TOKEN is required for real AI video generation.'), { status: 503 });
   }
   const model = process.env.REPLICATE_VIDEO_MODEL || 'kwaivgi/kling-v1.6-standard';
-  const response = await fetch('https://api.replicate.com/v1/predictions', {
+  const version = String(process.env.REPLICATE_VIDEO_VERSION || '').trim();
+  let endpoint;
+  let payload;
+
+  if (version) {
+    // The generic predictions endpoint requires a version selector.
+    endpoint = 'https://api.replicate.com/v1/predictions';
+    payload = { version, input };
+  } else {
+    // The model-specific endpoint accepts owner/name and uses that model's current version.
+    const parts = model.split('/');
+    if (parts.length !== 2 || !parts[0] || !parts[1]) {
+      throw Object.assign(new Error('REPLICATE_VIDEO_MODEL must be an owner/name model slug, or set REPLICATE_VIDEO_VERSION.'), { status: 500 });
+    }
+    endpoint = `https://api.replicate.com/v1/models/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[1])}/predictions`;
+    payload = { input };
+  }
+
+  const response = await fetch(endpoint, {
     method: 'POST',
     headers: {
       authorization: `Token ${process.env.REPLICATE_API_TOKEN}`,
       'content-type': 'application/json',
-      prefer: 'wait=0',
     },
-    body: JSON.stringify({ model, input }),
+    body: JSON.stringify(payload),
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.detail || data.error || `Replicate create failed with ${response.status}`);
-  return { model, prediction: data };
+  if (!response.ok) throw Object.assign(new Error(data.detail || data.error || `Replicate create failed with ${response.status}`), { status: response.status >= 500 ? 502 : response.status });
+  return { model: version ? `${model}@${version}` : model, prediction: data };
 }
 
 async function replicateGet(id) {
   if (!process.env.REPLICATE_API_TOKEN) throw Object.assign(new Error('REPLICATE_API_TOKEN is required.'), { status: 503 });
-  const response = await fetch(`https://api.replicate.com/v1/predictions/${id}`, {
+  const response = await fetch(`https://api.replicate.com/v1/predictions/${encodeURIComponent(id)}`, {
     headers: { authorization: `Token ${process.env.REPLICATE_API_TOKEN}` },
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.detail || data.error || `Replicate poll failed with ${response.status}`);
+  if (!response.ok) throw Object.assign(new Error(data.detail || data.error || `Replicate poll failed with ${response.status}`), { status: response.status >= 500 ? 502 : response.status });
   return data;
 }
 
@@ -219,24 +245,34 @@ async function handleSettings(req, res) {
   const updates = {};
   if (body.replicateToken) updates.REPLICATE_API_TOKEN = String(body.replicateToken).trim();
   if (body.model) updates.REPLICATE_VIDEO_MODEL = String(body.model).trim();
+  if (body.version) updates.REPLICATE_VIDEO_VERSION = String(body.version).trim();
   if (body.upgradeCode) updates.UPGRADE_ACCESS_CODE = String(body.upgradeCode).trim();
   if (body.proDailyCredits) updates.PRO_DAILY_CREDITS = String(Number(body.proDailyCredits));
-  if (!updates.REPLICATE_API_TOKEN && !updates.REPLICATE_VIDEO_MODEL && !updates.UPGRADE_ACCESS_CODE && !updates.PRO_DAILY_CREDITS) return send(res, 400, { error: 'No settings were provided.' });
+  if (!Object.keys(updates).length) return send(res, 400, { error: 'No settings were provided.' });
   await saveDotEnv(updates);
-  return send(res, 200, { ok: true, replicateConfigured: Boolean(process.env.REPLICATE_API_TOKEN), replicateTokenPreview: maskSecret(process.env.REPLICATE_API_TOKEN), model: process.env.REPLICATE_VIDEO_MODEL, upgradeConfigured: Boolean(process.env.UPGRADE_ACCESS_CODE), proDailyCredits: Number(process.env.PRO_DAILY_CREDITS || PRO_DAILY_CREDITS) });
+  return send(res, 200, {
+    ok: true,
+    replicateConfigured: Boolean(process.env.REPLICATE_API_TOKEN),
+    replicateTokenPreview: maskSecret(process.env.REPLICATE_API_TOKEN),
+    model: process.env.REPLICATE_VIDEO_MODEL,
+    version: process.env.REPLICATE_VIDEO_VERSION || '',
+    upgradeConfigured: Boolean(process.env.UPGRADE_ACCESS_CODE),
+    proDailyCredits: Number(process.env.PRO_DAILY_CREDITS || PRO_DAILY_CREDITS),
+  });
 }
 
 async function handleUpgrade(req, res) {
   const body = JSON.parse((await bodyBuffer(req)).toString('utf8') || '{}');
-  if (!process.env.UPGRADE_ACCESS_CODE) {
-    return send(res, 501, { error: 'Upgrade is not configured. Set UPGRADE_ACCESS_CODE to enable pro upgrades.' });
-  }
+  if (!process.env.UPGRADE_ACCESS_CODE) return send(res, 501, { error: 'Upgrade is not configured. Set UPGRADE_ACCESS_CODE to enable pro upgrades.' });
   if (body.code !== process.env.UPGRADE_ACCESS_CODE) return send(res, 403, { error: 'Invalid upgrade code.' });
-  const db = await readDb();
-  const wallet = ensureWallet(db, clientId(req));
-  wallet.plan = 'pro';
-  wallet.credits = Math.max(wallet.credits, PRO_DAILY_CREDITS);
-  await writeDb(db);
+  const wallet = await withDbLock(async () => {
+    const db = await readDb();
+    const current = ensureWallet(db, clientId(req));
+    current.plan = 'pro';
+    current.credits = Math.max(current.credits, PRO_DAILY_CREDITS);
+    await writeDb(db);
+    return { ...current };
+  });
   return send(res, 200, { ...wallet, dailyCredits: creditsForPlan(wallet.plan), nextRefreshUtc: nextRefreshUtc() });
 }
 
@@ -254,21 +290,22 @@ async function handleApi(req, res, url) {
     });
   }
   if (url.pathname === '/api/credits') {
-    const db = await readDb();
-    const wallet = ensureWallet(db, clientId(req));
-    await writeDb(db);
+    const wallet = await withDbLock(async () => {
+      const db = await readDb();
+      const current = ensureWallet(db, clientId(req));
+      await writeDb(db);
+      return { ...current };
+    });
     return send(res, 200, { ...wallet, dailyCredits: creditsForPlan(wallet.plan), nextRefreshUtc: nextRefreshUtc() });
   }
   if (url.pathname === '/api/settings' && (req.method === 'GET' || req.method === 'POST')) return handleSettings(req, res);
   if (url.pathname === '/api/upgrade' && req.method === 'POST') return handleUpgrade(req, res);
+
   if (url.pathname === '/api/generate-video' && req.method === 'POST') {
     const parsed = parseMultipart(await bodyBuffer(req), req.headers['content-type'] || '');
     const prompt = String(parsed.fields.prompt || '').trim();
     if (prompt.length < 12) return send(res, 400, { error: 'Prompt must be at least 12 characters.' });
-    const db = await readDb();
-    const wallet = ensureWallet(db, clientId(req));
-    if (wallet.credits < 1) return send(res, 402, { error: 'Daily free credits exhausted. Upgrade now or wait until 00:00 UTC for refresh.', wallet });
-    wallet.credits -= 1;
+
     const images = parsed.files.map(imageToDataUri);
     const input = {
       prompt,
@@ -278,23 +315,64 @@ async function handleApi(req, res, url) {
     };
     if (images[0]) input.image = images[0];
     if (images.length > 1) input.reference_images = images;
+
+    // Reserve the credit and persist a placeholder job before calling Replicate.
+    // This prevents overlapping requests from overwriting each other's DB snapshots.
+    const reservation = await withDbLock(async () => {
+      const db = await readDb();
+      const wallet = ensureWallet(db, clientId(req));
+      if (wallet.credits < 1) return { exhausted: true, wallet: { ...wallet } };
+      wallet.credits -= 1;
+      const localId = crypto.randomUUID();
+      db.jobs[localId] = {
+        providerId: null,
+        model: null,
+        status: 'creating',
+        mode: parsed.fields.mode === 'image' ? 'image' : 'text',
+        prompt,
+        createdAt: new Date().toISOString(),
+        clientId: clientId(req),
+      };
+      await writeDb(db);
+      return { exhausted: false, localId, wallet: { ...wallet } };
+    });
+
+    if (reservation.exhausted) return send(res, 402, { error: 'Daily free credits exhausted. Upgrade now or wait until 00:00 UTC for refresh.', wallet: reservation.wallet });
+
     try {
       const { model, prediction } = await replicateCreate(input);
-      const localId = crypto.randomUUID();
-      db.jobs[localId] = { providerId: prediction.id, model, mode: parsed.fields.mode === 'image' ? 'image' : 'text', prompt, createdAt: new Date().toISOString(), clientId: clientId(req) };
-      await writeDb(db);
-      return send(res, 200, { jobId: localId, prediction: cleanPrediction(prediction), wallet });
+      await withDbLock(async () => {
+        const db = await readDb();
+        const job = db.jobs[reservation.localId];
+        if (job) {
+          job.providerId = prediction.id;
+          job.model = model;
+          job.status = prediction.status || 'starting';
+          job.providerCreatedAt = prediction.created_at || new Date().toISOString();
+        }
+        await writeDb(db);
+      });
+      return send(res, 200, { jobId: reservation.localId, prediction: cleanPrediction(prediction), wallet: reservation.wallet });
     } catch (error) {
-      wallet.credits += 1;
-      await writeDb(db);
+      await withDbLock(async () => {
+        const db = await readDb();
+        const job = db.jobs[reservation.localId];
+        delete db.jobs[reservation.localId];
+        const wallet = ensureWallet(db, clientId(req));
+        wallet.credits += 1;
+        if (job) await writeDb(db);
+        else await writeDb(db);
+      });
       return send(res, error.status || 502, { error: error.message || 'Video provider failed before job creation.' });
     }
   }
+
   const match = url.pathname.match(/^\/api\/jobs\/([^/]+)$/);
   if (match) {
     const db = await readDb();
     const job = db.jobs[match[1]];
     if (!job) return send(res, 404, { error: 'Job not found.' });
+    if (!job.providerId) return send(res, 202, { job, prediction: { status: 'starting' } });
     try {
       return send(res, 200, { job, prediction: cleanPrediction(await replicateGet(job.providerId)) });
     } catch (error) {
