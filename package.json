@@ -9,6 +9,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "ffmpeg-static": "^5.2.0",
     "sharp": "^0.34.3"
   },
   "private": true,
