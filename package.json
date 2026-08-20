@@ -8,6 +8,9 @@
   "engines": {
     "node": ">=20"
   },
+  "dependencies": {
+    "sharp": "^0.34.3"
+  },
   "private": true,
   "type": "module"
 }
